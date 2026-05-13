@@ -1,224 +1,137 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
 import json
-import random
 import joblib
+import os
+import random
 
 app = Flask(__name__)
+CORS(app)
 
-# =========================
-# LOAD GEOJSON FILE
-# =========================
-with open("Wards.geojson", "r", encoding="utf-8") as f:
+# ✅ BASE DIRECTORY
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ✅ LOAD MODEL
+model_path = os.path.join(
+    BASE_DIR,
+    "flood_model.pkl"
+)
+
+model = joblib.load(model_path)
+
+# ✅ LOAD GEOJSON
+geojson_path = os.path.join(
+    BASE_DIR,
+    "Wards.geojson"
+)
+
+with open(geojson_path) as f:
+
     geojson_data = json.load(f)
 
-# =========================
-# LOAD MODEL
-# =========================
-model = joblib.load("flood_model.pkl")
+    wards = geojson_data["features"]
 
-# =========================
-# CREATE WARDS LIST
-# =========================
-wards = []
 
-# CHECK GEOJSON STRUCTURE
-if isinstance(geojson_data, dict) and "features" in geojson_data:
-
-    features = geojson_data["features"]
-
-elif isinstance(geojson_data, list):
-
-    features = geojson_data
-
-else:
-
-    features = []
-
-# =========================
-# LOOP THROUGH FEATURES
-# =========================
-for feature in features:
-
-    # IF properties EXISTS
-    if isinstance(feature, dict) and "properties" in feature:
-
-        props = feature["properties"]
-
-    else:
-
-        props = feature
-
-    ward = {
-
-        "ward_no": props.get("Ward_No", 0),
-
-        "zone_no": props.get("Zone_No", "Unknown"),
-
-        "zone_name": props.get("Zone_Name", "Unknown"),
-
-        # TEMP VALUES
-        "elevation": round(random.uniform(1, 15), 2),
-
-        "water_distance": round(random.uniform(0.1, 5), 2)
-    }
-
-    wards.append(ward)
-
-print(f"Loaded {len(wards)} wards")
-
-# =========================
-# RISK LEVEL FUNCTION
-# =========================
-def get_risk_level(score):
-
-    if score > 120:
-
-        return "HIGH"
-
-    elif score >= 80:
-
-        return "MEDIUM"
-
-    else:
-
-        return "LOW"
-
-# =========================
-# REASON FUNCTION
-# =========================
-def generate_reason(elevation, water_distance):
-
-    if elevation < 4 and water_distance < 0.5:
-
-        return "Low elevation and very close to water"
-
-    elif elevation < 5:
-
-        return "Low elevation increases flood risk"
-
-    elif water_distance < 0.5:
-
-        return "Close to water body increases risk"
-
-    else:
-
-        return "Moderate conditions"
-
-# =========================
-# HOME ROUTE
-# =========================
-@app.route("/")
-def home():
-
-    return """
-    <h1>Flood Risk API Running 🚀</h1>
-
-    <p>Click below:</p>
-
-    <a href="/get-risk?rainfall=250">
-        Check Flood Risk
-    </a>
-    """
-
-# =========================
-# MAIN API
-# =========================
-@app.route("/get-risk", methods=["GET"])
+@app.route("/get-risk")
 def get_risk():
 
-    rainfall = request.args.get("rainfall")
+    rainfall = float(
+        request.args.get("rainfall", 250)
+    )
 
-    # CHECK INPUT
-    if rainfall is None:
+    results = []
 
-        return jsonify({
-            "error": "Rainfall required"
-        }), 400
-
-    # CONVERT TO FLOAT
-    try:
-
-        rainfall = float(rainfall)
-
-    except:
-
-        return jsonify({
-            "error": "Invalid rainfall"
-        }), 400
-
-    result = []
-
-    # =========================
-    # LOOP THROUGH ALL WARDS
-    # =========================
     for ward in wards:
 
-        elevation = ward["elevation"]
+        properties = ward["properties"]
 
-        water_distance = ward["water_distance"]
+        ward_no = properties["Ward_No"]
 
-        # =========================
-        # MODEL PREDICTION
-        # =========================
-        score = model.predict([
-            [rainfall, elevation, water_distance]
-        ])[0]
-
-        score = float(round(score, 2))
-
-        # GET LEVEL
-        level = get_risk_level(score)
-
-        # GET REASON
-        reason = generate_reason(
-            elevation,
-            water_distance
+        # ✅ RANDOM DEMO VALUES
+        elevation = round(
+            random.uniform(1, 10),
+            2
         )
 
-        # FINAL RESULT
-        result.append({
+        water_distance = round(
+            random.uniform(0.1, 3),
+            2
+        )
 
-            "ward_no": ward["ward_no"],
+        # ✅ MODEL INPUT
+        features = [[
+            rainfall,
+            elevation,
+            water_distance
+        ]]
 
-            "zone_no": ward["zone_no"],
+        score = model.predict(features)[0]
 
-            "zone_name": ward["zone_name"],
+        # ✅ RISK LEVEL
+        if score >= 150:
 
-            "score": score,
+            level = "HIGH"
 
-            "level": level,
+            reason = (
+                "Low elevation and close to water"
+            )
 
-            "elevation": elevation,
+        elif score >= 100:
 
-            "water_distance": water_distance,
+            level = "MEDIUM"
+
+            reason = (
+                "Moderate flood conditions"
+            )
+
+        else:
+
+            level = "LOW"
+
+            reason = (
+                "Safer flood conditions"
+            )
+
+        results.append({
+
+            "ward_no": ward_no,
+
+            "ward_name":
+            f"Ward {ward_no}",
 
             "rainfall": rainfall,
 
+            "elevation": elevation,
+
+            "water_distance":
+            water_distance,
+
+            "score":
+            round(float(score), 2),
+
+            "level": level,
+
             "reason": reason
+
         })
 
-    # =========================
-    # SORT BY HIGH RISK
-    # =========================
-    result = sorted(
-        result,
-        key=lambda x: x["score"],
-        reverse=True
-    )
+    return jsonify(results)
 
-    # =========================
-    # RETURN JSON
-    # =========================
+
+@app.route("/")
+def home():
+
     return jsonify({
-
-        "total_wards": len(result),
-
-        "data": result
+        "message":
+        "FloodSense Backend Running"
     })
 
-# =========================
-# RUN SERVER
-# =========================
+
 if __name__ == "__main__":
 
-    app.run(debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=True
+    )
