@@ -1,0 +1,30 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Environment configurations and secrets
+.env
+.env.local
+.env.*.local
+
+# Logs and runtime artifacts
+*.log
+*.sqlite3
+
+# Database backups and temporary dumps
+backup/
+*.bak
+*.json.bak
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
