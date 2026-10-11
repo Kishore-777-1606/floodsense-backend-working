@@ -7,3 +7,4 @@ joblib
 gunicorn
 pymongo
 python-dotenv
+shapely>=2.1,<3.0
