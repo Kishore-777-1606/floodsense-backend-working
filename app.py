@@ -12,6 +12,7 @@ import flood_explainability
 import flood_actions
 import flood_propagation
 import flood_simulator
+import ward1_telemetry
 
 app = Flask(__name__)
 CORS(app)
@@ -28,6 +29,9 @@ geojson_path = os.path.join(BASE_DIR, "Wards.geojson")
 with open(geojson_path, "r", encoding="utf-8") as f:
     geojson_data = json.load(f)
     wards = geojson_data["features"]
+
+# Extract authoritative Ward 1 baseline properties for edge integration
+ward1_properties = ward1_telemetry.get_ward1_base_properties(wards)
 
 # ✅ INITIALIZE DATABASE AND PERSISTENT MEMORY
 db.init_db()
@@ -51,6 +55,29 @@ def compute_all_wards_baseline_data():
         rainfall_mm = float(properties.get("rainfall_mm", 0.0))
         elevation_m = float(properties.get("elevation_m", 0.0))
         water_distance_km = float(properties.get("water_distance_km", 0.0))
+
+        # Scope Protection: Ward 1 Live IoT Validation Integration
+        live_telemetry_payload = None
+        live_received_at_iso = None
+        if ward_no == 1:
+            try:
+                database = db.get_db()
+                if database is not None:
+                    success, _, latest_doc = ward1_telemetry.get_latest_ward1_reading(database)
+                    if success and latest_doc:
+                        readings = latest_doc.get("sensor_readings", {})
+                        live_telemetry_payload = readings
+                        live_received_at_iso = latest_doc.get("received_at_iso")
+                        # Ward 1 prediction: Replace static GeoJSON baseline rainfall (39.2 mm)
+                        # with latest ESP32 telemetry numeric value as requested.
+                        # Note: This ESP32 value is an ultrasonic reading, not measured rainfall.
+                        u_data = readings.get("ultrasonic_telemetry") or {}
+                        if readings.get("rainfall_sensor_present") and readings.get("rainfall_mm") is not None:
+                            rainfall_mm = float(readings["rainfall_mm"])
+                        elif u_data.get("value_cm") is not None:
+                            rainfall_mm = float(u_data["value_cm"])
+            except Exception:
+                pass
 
         # Model Input (EXACTLY 3 features preserved for XGBoost compatibility)
         features = [[rainfall_mm, elevation_m, water_distance_km]]
@@ -103,10 +130,15 @@ def compute_all_wards_baseline_data():
 
         # Improvement 3: Explainability and Action Support Integration
         try:
+            eval_props = properties
+            if ward_no == 1:
+                eval_props = dict(properties)
+                eval_props["rainfall_mm"] = rainfall_mm
+
             exp_res = flood_explainability.generate_ward_risk_explanation(
                 ward_no=ward_no,
                 model=model,
-                ward_props=properties,
+                ward_props=eval_props,
                 rainfall_memory=ward_mem,
                 flood_momentum=momentum,
                 base_score=base_score
@@ -175,6 +207,10 @@ def compute_all_wards_baseline_data():
             "rainfall_mm": round(rainfall_mm, 2),
             "elevation_m": round(elevation_m, 2),
             "water_distance_km": round(water_distance_km, 3),
+
+            # Ward 1 Live Edge Telemetry (None for Wards 2-201)
+            "live_telemetry": live_telemetry_payload,
+            "live_received_at": live_received_at_iso,
 
             # Model outputs
             "base_score": round(base_score, 2),
@@ -307,6 +343,25 @@ def get_ward_history(ward_no):
     elev = float(ward_props.get("elevation_m", 6.7)) if ward_props else 6.7
     w_dist = float(ward_props.get("water_distance_km", 10.0)) if ward_props else 10.0
     r_curr = float(ward_props.get("rainfall_mm", mem.get("1h", 0.0))) if ward_props else float(mem.get("1h", 0.0))
+
+    # Ward 1 Scope Protection: Live IoT Validation Integration
+    live_telemetry_payload = None
+    if ward_no == 1:
+        try:
+            database = db.get_db()
+            if database is not None:
+                success, _, latest_doc = ward1_telemetry.get_latest_ward1_reading(database)
+                if success and latest_doc:
+                    readings = latest_doc.get("sensor_readings", {})
+                    live_telemetry_payload = readings
+                    u_data = readings.get("ultrasonic_telemetry") or {}
+                    if readings.get("rainfall_sensor_present") and readings.get("rainfall_mm") is not None:
+                        r_curr = float(readings["rainfall_mm"])
+                    elif u_data.get("value_cm") is not None:
+                        r_curr = float(u_data["value_cm"])
+        except Exception:
+            pass
+
     mom = rainfall_memory.calculate_flood_momentum(mem, elev, w_dist)
 
     # Compute base and final score
@@ -385,6 +440,9 @@ def get_ward_history(ward_no):
         "ward_name": f"Ward {ward_no}",
         "elevation_m": elev,
         "water_distance_km": w_dist,
+        "rainfall": round(r_curr, 2),
+        "rainfall_mm": round(r_curr, 2),
+        "live_telemetry": live_telemetry_payload,
         "base_score": round(base_s, 2),
         "score": f_score,
         "level": lvl,
@@ -511,6 +569,167 @@ def rainfall_scenario_endpoint():
         return jsonify({
             "status": "ERROR",
             "error_type": "INTERNAL_SIMULATOR_ERROR",
+            "message": str(e)
+        }), 500
+
+
+# ============================================================================
+# WARD 1 ESP32 LIVE SENSOR INTEGRATION
+# ============================================================================
+
+@app.route("/api/ward1/sensor-data", methods=["POST"])
+@app.route("/ward1/sensor-data", methods=["POST"])
+def ingest_ward1_sensor_data():
+    """
+    Ingests live telemetry from the dedicated ESP32 edge device deployed in Ward 1.
+    Accepts validated temperature and humidity. Accepts rainfall only if a real
+    rainfall sensor reading is present. Never fabricates rainfall or maps ultrasonic
+    distance to rainfall.
+    Persists combined record to `ward1_live_data` collection in MongoDB.
+    """
+    try:
+        payload = request.get_json(silent=True)
+        if payload is None:
+            return jsonify({
+                "status": "ERROR",
+                "error_type": "INVALID_JSON",
+                "message": "Request body must be a valid JSON object"
+            }), 400
+
+        is_valid, err_msg, clean_data = ward1_telemetry.validate_sensor_payload(payload)
+        if not is_valid:
+            return jsonify({
+                "status": "ERROR",
+                "error_type": "VALIDATION_ERROR",
+                "message": err_msg
+            }), 400
+
+        database = db.get_db()
+        if database is None:
+            return jsonify({
+                "status": "ERROR",
+                "error_type": "DATABASE_UNAVAILABLE",
+                "message": "Database connection is unavailable"
+            }), 503
+
+        success, save_err, saved_doc = ward1_telemetry.save_ward1_reading(
+            db_instance=database,
+            ward1_props=ward1_properties,
+            telemetry_data=clean_data,
+            model=model
+        )
+
+        if not success:
+            return jsonify({
+                "status": "ERROR",
+                "error_type": "PERSISTENCE_FAILED",
+                "message": save_err or "Failed to record Ward 1 sensor data"
+            }), 500
+
+        return jsonify({
+            "status": "SUCCESS",
+            "message": "Ward 1 sensor reading accepted and recorded",
+            "data": saved_doc
+        }), 201
+
+    except Exception as e:
+        return jsonify({
+            "status": "ERROR",
+            "error_type": "INTERNAL_INGESTION_ERROR",
+            "message": str(e)
+        }), 500
+
+
+@app.route("/api/ward1/latest", methods=["GET"])
+@app.route("/ward1/latest", methods=["GET"])
+def get_latest_ward1_live_data():
+    """
+    Returns the latest combined live telemetry record for Ward 1 (Thiruvottiyur)
+    from the dedicated `ward1_live_data` collection.
+    """
+    try:
+        database = db.get_db()
+        if database is None:
+            return jsonify({
+                "status": "ERROR",
+                "error_type": "DATABASE_UNAVAILABLE",
+                "message": "Database connection is unavailable"
+            }), 503
+
+        success, err_msg, doc = ward1_telemetry.get_latest_ward1_reading(database)
+        if not success:
+            if err_msg == "NOT_FOUND":
+                return jsonify({
+                    "status": "NOT_FOUND",
+                    "message": "No live sensor readings found for Ward 1 yet",
+                    "ward_properties": ward1_properties
+                }), 404
+            return jsonify({
+                "status": "ERROR",
+                "error_type": "RETRIEVAL_FAILED",
+                "message": err_msg or "Failed to retrieve latest Ward 1 record"
+            }), 500
+
+        return jsonify({
+            "status": "SUCCESS",
+            "data": doc
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "ERROR",
+            "error_type": "INTERNAL_RETRIEVAL_ERROR",
+            "message": str(e)
+        }), 500
+
+
+@app.route("/api/ward1/live-data", methods=["GET", "POST"])
+@app.route("/ward1/live-data", methods=["GET", "POST"])
+def ward1_live_data_unified():
+    """
+    Unified route supporting both GET (latest reading) and POST (sensor ingestion)
+    for Ward 1 live telemetry.
+    """
+    if request.method == "POST":
+        return ingest_ward1_sensor_data()
+    return get_latest_ward1_live_data()
+
+
+@app.route("/api/ward1/history", methods=["GET"])
+@app.route("/ward1/history", methods=["GET"])
+def get_ward1_telemetry_history():
+    """
+    Returns bounded chronological history of live Ward 1 telemetry records
+    for time-series charting.
+    """
+    try:
+        database = db.get_db()
+        if database is None:
+            return jsonify({
+                "status": "ERROR",
+                "error_type": "DATABASE_UNAVAILABLE",
+                "message": "Database connection is unavailable"
+            }), 503
+
+        limit = request.args.get("limit", default=30, type=int)
+        success, err_msg, docs = ward1_telemetry.get_ward1_history(database, limit=limit)
+        if not success:
+            return jsonify({
+                "status": "ERROR",
+                "error_type": "RETRIEVAL_FAILED",
+                "message": err_msg or "Failed to retrieve Ward 1 history"
+            }), 500
+
+        return jsonify({
+            "status": "SUCCESS",
+            "count": len(docs),
+            "data": docs
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "ERROR",
+            "error_type": "INTERNAL_RETRIEVAL_ERROR",
             "message": str(e)
         }), 500
 

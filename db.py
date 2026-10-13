@@ -82,6 +82,11 @@ def init_db():
     daily_col = db["rainfall_daily_summary"]
     daily_col.create_index([("ward_no", ASCENDING), ("date", DESCENDING)], unique=True, name="idx_ward_date_unique")
 
+    # 3. Ward 1 Live ESP32 Telemetry Collection
+    w1_col = db["ward1_live_data"]
+    w1_col.create_index([("received_at", DESCENDING)], name="idx_w1_received_at")
+    w1_col.create_index([("ward_no", ASCENDING), ("received_at", DESCENDING)], name="idx_w1_ward_received")
+
     logger.info("✅ MongoDB collections and indexes initialized successfully.")
     return True
 
